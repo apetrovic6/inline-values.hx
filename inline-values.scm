@@ -409,18 +409,21 @@
 (register-hook 'selection-did-change (lambda (view-id) (inline-values-render)))
 
 ;; Terminate is the lifecycle event that does NOT move the cursor: no
-;; set_selection, so no selection-did-change, and the #f branch's
-;; stale-value clear would never run -- the e2e caught hints surviving
-;; `space G t` until some unrelated cursor move. post-command fires for the
-;; terminate keypress itself, and for the next keystroke after a debuggee
-;; exits on its own (also cursor-free). Same light path per command: frame
-;; read, tuple compare, return -- the 0-refetch gate is untouched.
+;; set_selection, so no selection-did-change. The teardown is also async --
+;; dap_terminate sends the request and returns, unset_active_client runs in
+;; the response callback, after which NO Steel event fires -- so post-command
+;; for the terminate key itself still sees the old frame and early-returns
+;; (measured). What saves it: space G is a STICKY menu, so leaving it after
+;; `space G t` is a keypress, and that command's post-command runs after the
+;; teardown has landed: frame #f, hints cleared. The e2e asserts exactly
+;; this (terminate, Escape, gone).
 (register-hook 'post-command (lambda (command-name) (inline-values-render)))
 
 ;; The debuggee's tty is an external terminal window in this setup (the
-;; debug-start template spawns foot), so terminate/exit closes a window and
-;; hands focus back to helix -- with no keypress and no selection change in
-;; between. This is the only trigger that can clear the hints with zero user
-;; input after the async teardown lands; where focus events do not arrive it
-;; simply never fires and post-command covers the next keystroke.
+;; debug-start template spawns foot), so terminate/exit closes it and helix
+;; regains terminal focus with no keypress. Measured: that FocusGained
+;; arrives BEFORE the async teardown lands, so the frame still compares
+;; equal and nothing clears -- but environments where focus returns later
+;; get a zero-input clear for free, and when it does fire the cost is the
+;; same light path.
 (register-hook 'terminal-focus-gained (lambda () (inline-values-render)))

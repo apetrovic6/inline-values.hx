@@ -24,22 +24,35 @@ what makes the refresh gate below sound.
 
 ## How it works
 
-**Trigger.** Two hooks:
+**Trigger.** Three hooks:
 
 ```scheme
 (register-hook 'selection-did-change (lambda (view-id) (inline-values-render)))
 (register-hook 'post-command (lambda (command-name) (inline-values-render)))
+(register-hook 'terminal-focus-gained (lambda () (inline-values-render)))
 ```
 
 A debugger stop calls `jump_to_stack_frame`, which ends in `doc.set_selection`,
 which dispatches `SelectionDidChange`. Stops, steps and frame switches all move
 the cursor, so all three fire the first hook. No DAP event hook is needed (and
-none exists). **Terminate is the exception**: it moves nothing, so without the
-second hook the stale-value clear never runs — the e2e caught hints surviving
-`space G t` until an unrelated cursor move. `post-command` fires for the
-terminate keypress itself, and for the next keystroke after a debuggee exits
-on its own. Both hooks run the same light path, so the gate below is what
-every firing costs.
+none exists).
+
+**Terminate is the exception, and its semantics are worth stating exactly.**
+It moves no cursor, and its teardown is async: `dap_terminate` sends the DAP
+request and returns, `unset_active_client` runs in the response callback —
+after which *no Steel event fires at all*. So the `post-command` of the
+terminate keypress itself still sees the old frame and early-returns
+(measured). What makes the hints disappear anyway: `space G` is a **sticky**
+menu, so leaving it after `space G t` is necessarily another keypress, and
+that command's `post-command` runs after the teardown has landed — frame
+`#f`, hints cleared. Net observable behavior: the values vanish together
+with the debug menu, with no stale window a user can reach. A debuggee
+exiting on its own clears on the next editor event the same way.
+`terminal-focus-gained` is registered for the external-tty setups where
+focus returns *after* teardown (zero-input clear); measured against the foot
+window here, focus returns *before* the teardown lands, so it early-returns
+harmlessly and `post-command` does the work. All three hooks run the same
+light path, so the gate below is what every firing costs.
 
 **Refresh gate.** The hook fires on every cursor move; values only change when
 the debugger does:
