@@ -252,9 +252,11 @@
             (when (not (equal? frame last-frame))
               (set! last-frame frame)
               (set! cached-vars (fetch-local-vars))
+              ;; the whole tuple, id included: a re-stop on the same line
+              ;; shows the same (path line column) with a new id, which is
+              ;; the case the id exists to catch
               (log::info! (string-append "[inline-values] frame -> "
-                                         (to-string (list-ref frame 0)) ":"
-                                         (to-string (list-ref frame 1)) ", "
+                                         (to-string frame) ", "
                                          (to-string (length cached-vars))
                                          " local(s)")))
             (set! last-doc doc)
