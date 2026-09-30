@@ -416,3 +416,11 @@
 ;; exits on its own (also cursor-free). Same light path per command: frame
 ;; read, tuple compare, return -- the 0-refetch gate is untouched.
 (register-hook 'post-command (lambda (command-name) (inline-values-render)))
+
+;; The debuggee's tty is an external terminal window in this setup (the
+;; debug-start template spawns foot), so terminate/exit closes a window and
+;; hands focus back to helix -- with no keypress and no selection change in
+;; between. This is the only trigger that can clear the hints with zero user
+;; input after the async teardown lands; where focus events do not arrive it
+;; simply never fires and post-command covers the next keystroke.
+(register-hook 'terminal-focus-gained (lambda () (inline-values-render)))
