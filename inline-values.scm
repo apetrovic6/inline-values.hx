@@ -1,13 +1,17 @@
 ;;; inline-values.hx -- debugger values drawn inline in the buffer.
 ;;;
 ;;; While the debugger is stopped, draws the stopped frame's variable values
-;;; after each parameter of the function signature the frame is in:
+;;; after each parameter of the function signature the frame is in, and after
+;;; each simple `let` statement in its body:
 ;;;
-;;;     fn add(x: f32 = 5, y: f32 = 10.5)
+;;;     fn add(x: f32 = 5, y: f32 = 10.5) -> f32 {
+;;;         let sum = x + y; = 15.5
 ;;;
-;;; v1 scope, deliberately narrow: function parameters only, the stopped
-;;; frame only, the focused buffer only, Rust only. Let bindings, parent
-;;; frames and struct expansion come after.
+;;; Parameters are the values you were called with; the lets are the ones you
+;;; are building. v1.5 scope, still deliberately narrow: function parameters
+;;; and single-name let bindings only, the stopped frame only, the focused
+;;; buffer only, Rust only. Destructuring patterns, parent frames and struct
+;;; expansion come after.
 ;;;
 ;;; Requires a helix carrying the DAP Steel API (dap-current-frame,
 ;;; dap-scopes, dap-variables) and the styled inlay hint API
@@ -160,18 +164,131 @@
       [(equal? (list-ref (car vs) 0) name) (car vs)]
       [else (loop (cdr vs))])))
 
+;; -- let bindings -----------------------------------------------------------
+
+;; The identifier a pattern binds, or #f when the pattern is not a single
+;; plain name. Handles both shapes tree-sitter-rust produces for `mut`:
+;; the mutable_specifier sibling slot (what let_declaration actually uses at
+;; the grammar rev helix pins -- mut_pattern is prec(-1) and loses to it)
+;; and the mut_pattern wrapper, which other pattern positions can still
+;; surface. Every other pattern kind -- tuple, struct, tuple-struct, ref,
+;; or, wildcard -- binds zero or several names and each would need its own
+;; anchor per name: skipped silently, a follow-up rather than an error.
+(define (pattern-name-node pat)
+  (cond
+    [(not pat) #f]
+    [(equal? (tsnode-kind pat) "identifier") pat]
+    [(equal? (tsnode-kind pat) "mut_pattern")
+     (pattern-name-node (find-child pat
+                                    (lambda (n)
+                                      (not (equal? (tsnode-kind n) "mutable_specifier")))))]
+    [else #f]))
+
+;; The pattern node of a let_declaration: the first NAMED child that is not
+;; the mutable_specifier. Named, because the leading `let` keyword is an
+;; anonymous child and would otherwise match any "not mut" predicate.
+(define (let-pattern-node node)
+  (let loop ([cs (tsnode-named-children node)])
+    (cond
+      [(null? cs) #f]
+      [(equal? (tsnode-kind (car cs)) "mutable_specifier") (loop (cdr cs))]
+      [else (car cs)])))
+
+;; (name anchor-char line) for one let_declaration, or '() when its pattern
+;; is not a single plain name. The anchor is the declaration's end byte --
+;; after the `;` -- so the value sits at the end of the statement, where VS
+;; Code and IntelliJ put it: a second `= 15.5` in the middle of a line that
+;; already has an `=` and an initializer reads as part of the expression.
+(define (let-anchor text node)
+  (define name-node (pattern-name-node (let-pattern-node node)))
+  (if name-node
+      (list (list (node-text text name-node)
+                  (b->c text (tsnode-end-byte node))
+                  (node-start-line text node)))
+      '()))
+
+;; Every simple let in fn-node's body, in source order, as (name anchor line)
+;; triples. A recursive walk, not just named children: lets nest inside
+;; blocks, if/match arms and loops. Subtrees that open a DIFFERENT scope than
+;; the stopped frame's are pruned -- nested function_item, closure_expression,
+;; async_block, try_block: their lets are not this frame's locals, and
+;; annotating them from the outer frame's variables would put a confidently
+;; wrong value on the line whenever a captured name collides.
+(define (collect-lets text node acc)
+  (let loop ([cs (tsnode-children node)] [acc acc])
+    (if (null? cs)
+        acc
+        (let* ([c (car cs)]
+               [k (tsnode-kind c)])
+          (if (or (equal? k "function_item")
+                  (equal? k "closure_expression")
+                  (equal? k "async_block")
+                  (equal? k "try_block"))
+              (loop (cdr cs) acc)
+              (let* ([acc2 (if (equal? k "let_declaration")
+                               (append acc (let-anchor text c))
+                               acc)])
+                (loop (cdr cs) (collect-lets text c acc2))))))))
+
+(define (name-in-entries? entries name)
+  (let loop ([es entries])
+    (cond
+      [(null? es) #f]
+      [(equal? (list-ref (car es) 0) name) #t]
+      [else (loop (cdr es))])))
+
+;; The shadowing rule (v1.5, deliberately bounded, and the thing the
+;; scope-aware follow-up replaces): when a name is bound by more than one let
+;; in the function, annotate ONLY the last binding at or above the stop line
+;; -- the one most likely in scope -- and leave the others bare. lldb may
+;; report two locals both named "x" and nothing in the DAP response says
+;; which block each belongs to, so per name this is the best available guess,
+;; and a confidently wrong number is worse than a blank line. Lets below the
+;; stop line are dropped here as well: lldb usually does not report an
+;; un-executed binding anyway (measured: a stop ON the let line reports 3
+;; locals, one step later 4), but the filter does not rely on that.
+;; Triples come in source order, so for one name the later entry replaces the
+;; earlier; returns ((name . anchor-char) ...).
+(define (dedupe-let-anchors triples stop-line)
+  (let loop ([ts triples] [kept '()])
+    (if (null? ts)
+        (map (lambda (t) (cons (list-ref t 0) (list-ref t 1))) kept)
+        (let* ([t (car ts)]
+               [name (list-ref t 0)])
+          (if (> (list-ref t 2) stop-line)
+              (loop (cdr ts) kept)
+              (loop (cdr ts)
+                    (if (name-in-entries? kept name)
+                        (map (lambda (e) (if (equal? (list-ref e 0) name) t e)) kept)
+                        (append kept (list t)))))))))
+
+;; (name . anchor-char) per simple let in fn-node's body, deduped per the
+;; shadowing rule above.
+(define (let-anchors text fn-node stop-line)
+  (dedupe-let-anchors (collect-lets text fn-node '()) stop-line))
+
 ;; -- drawing ----------------------------------------------------------------
 
-(define (draw-parameters text fn-node vars)
-  (let loop ([anchors (parameter-anchors text fn-node)])
-    (when (not (null? anchors))
-      (define binding (car anchors))
+;; One hint per (name . anchor-char) whose name the Local scope reports.
+;; Shared by the parameter and let passes: same find-var, same truncation,
+;; same style -- consistency is the default; making lets dimmer than
+;; signature values would be a one-token change in value-style.
+(define (draw-anchors anchors vars)
+  (let loop ([as anchors])
+    (when (not (null? as))
+      (define binding (car as))
       (define var (find-var (car binding) vars))
       (when var
         (add-styled-inlay-hint (cdr binding)
                                (list (list (string-append " = " (truncate-value (list-ref var 2)))
                                            (value-style)))))
-      (loop (cdr anchors)))))
+      (loop (cdr as)))))
+
+(define (draw-parameters text fn-node vars)
+  (draw-anchors (parameter-anchors text fn-node) vars))
+
+(define (draw-lets text fn-node vars stop-line)
+  (draw-anchors (let-anchors text fn-node stop-line) vars))
 
 ;; Fetch the Local scope's variables: (dap-scopes) to find its reference,
 ;; then (dap-variables). Two DAP round-trips, and the only place this plugin
@@ -204,15 +321,17 @@
         (when tree
           (define text (editor->text doc))
           ;; frame.line is 1-based (DAP); rope and tree lines are 0-based.
+          (define stop-line (- (list-ref frame 1) 1))
           ;; The binding is called fnode, not fn: `fn` is Steel's lambda
           ;; shorthand, and (define fn ...) panics the compiler's analysis
           ;; pass (Option::unwrap on a desugared non-atom name) -- which
           ;; takes helix down at startup, before a frame is ever drawn.
           (define fnode (find-function-at-line text
                                                (tstree->root tree)
-                                               (- (list-ref frame 1) 1)))
+                                               stop-line))
           (when fnode
-            (draw-parameters text fnode vars))))
+            (draw-parameters text fnode vars)
+            (draw-lets text fnode vars stop-line))))
       ;; Not the frame's file: never draw. If this buffer still holds hints
       ;; from earlier, drop them so no stale values survive over text the
       ;; debugger has moved away from.

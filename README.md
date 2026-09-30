@@ -1,12 +1,13 @@
 # inline-values.hx
 
 Debugger values drawn inline in the [Helix](https://helix-editor.com) editor
-while stopped — the `fn add(x: f32 = 5, y: f32 = 10.5)` rendering popularized
-by VS Code / IntelliJ, for a codelldb session in Helix.
+while stopped — the `fn add(x: f32 = 5, y: f32 = 10.5)` / `let sum = x + y; = 15.5`
+rendering popularized by VS Code / IntelliJ, for a codelldb session in Helix.
 
-> **Status: v1, deliberately narrow.** Function parameters only, the stopped
-> frame only, the focused buffer only, Rust only. Let bindings, parent frames
-> and struct expansion come after (see *Out of scope*).
+> **Status: v1.5, still deliberately narrow.** Function parameters and
+> single-name `let` bindings, the stopped frame only, the focused buffer
+> only, Rust only. Destructuring patterns, parent frames and struct
+> expansion come after (see *Out of scope*).
 
 Requires Helix with the experimental Steel plugin system
 ([mattwparas/helix, `steel-event-system`](https://github.com/mattwparas/helix/tree/steel-event-system))
@@ -59,6 +60,32 @@ parameter's end byte converted through `text.rope-byte->char`, which is what
 keeps hints correct when a comment upstream has an accent in it. Values are
 truncated to 40 characters.
 
+**Let placement (v1.5).** The same `function_item` is then walked recursively
+for `let_declaration` nodes — through blocks, `if`/`match` arms and loops —
+pruning subtrees that open a *different* scope than the stopped frame's
+(nested `function_item`, `closure_expression`, `async_block`, `try_block`):
+their `let`s are not this frame's locals, and annotating them from the outer
+frame's variables could put a confidently wrong value on the line when a
+captured name collides. Only patterns binding a single plain name are drawn
+(`identifier`, with `mut` handled in both shapes tree-sitter-rust produces —
+the `mutable_specifier` sibling slot, which is what `let mut` actually uses
+at the pinned grammar rev since `mut_pattern` is `prec(-1)`, and the
+`mut_pattern` wrapper); destructuring is skipped silently. The hint anchors
+at the declaration's end byte — after the `;` — because a second `= 15.5`
+mid-line, in a statement that already has an `=` and an initializer, reads as
+part of the expression. Un-executed `let`s below the stop line need no
+filtering in the common case: lldb reports a local only once it is in scope,
+so `find-var` simply misses.
+
+**Shadowing is bounded, not solved.** lldb can report two locals with the
+same name and nothing in the DAP response says which block each belongs to,
+so when a name is bound by several `let`s, only the **last binding at or
+above the stop line** is annotated and the others stay bare — the binding
+most likely in scope, and a blank line rather than a confidently wrong
+number for the rest. Scope-aware resolution from tree-sitter replaces this
+rule; until then it is the deliberate v1.5 behavior (see the comment on
+`dedupe-let-anchors`).
+
 **Clearing.** `clear-decorations!` drops every plugin overlay and styled hint
 in the focused view (native LSP inlay hints are separate storage and survive).
 It is only ever called in the stopped frame's Rust buffer — the one place
@@ -95,14 +122,17 @@ against the counter tui app.
 
 In rough order of what to add next:
 
-- **let bindings** — same walk, different node kind (`let_declaration`).
+- **destructuring patterns** — `tuple_pattern`, `struct_pattern`,
+  `tuple_struct_pattern`, `ref_pattern`, `or_pattern`: each binds several
+  names and needs one anchor per name, plus a choice of which end of the
+  pattern to hang each on. Skipped silently today.
 - **parent frames** — when switching frames with `space G s f` the frame
   tuple changes, so the gate already refetches; drawing a frame from a file
   that is not focused is the missing piece.
 - **struct expansion** — the fourth element of each `(name type value
   reference)` variable tuple is the handle; `reference` 0 means leaf.
-- **shadowed names in nested blocks** — needs scope ranges from tree-sitter
-  rather than name matching; the one genuinely hard piece.
+- **scope-aware shadowing** — replace the last-at-or-above-stop-line rule
+  with real scope ranges from tree-sitter; the one genuinely hard piece.
 - **non-Rust languages** — per-language node kinds and a different scope name
   than `"Local"`.
 
