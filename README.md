@@ -150,8 +150,12 @@ In rough order of what to add next:
   that is not focused is the missing piece.
 - **struct expansion** — the fourth element of each `(name type value
   reference)` variable tuple is the handle; `reference` 0 means leaf.
-- **scope-aware shadowing** — replace the last-at-or-above-stop-line rule
-  with real scope ranges from tree-sitter; the one genuinely hard piece.
+- **shadowing between two live bindings** — a binding is annotated only when
+  its own block still contains the stop line, so an exited block's binding is
+  left bare and the live one takes the value. What remains is the case where
+  two same-named bindings are *both* in scope at the stop: there the innermost
+  declaration is still a guess, since nothing in the DAP response says which
+  block a variable belongs to. Narrow, but the genuinely hard piece.
 - **non-Rust languages** — per-language node kinds and a different scope name
   than `"Local"`.
 

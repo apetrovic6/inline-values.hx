@@ -194,27 +194,38 @@
       [(equal? (tsnode-kind (car cs)) "mutable_specifier") (loop (cdr cs))]
       [else (car cs)])))
 
-;; (name anchor-char line) for one let_declaration, or '() when its pattern
-;; is not a single plain name. The anchor is the declaration's end byte --
-;; after the `;` -- so the value sits at the end of the statement, where VS
-;; Code and IntelliJ put it: a second `= 15.5` in the middle of a line that
-;; already has an `=` and an initializer reads as part of the expression.
-(define (let-anchor text node)
+;; (name anchor-char line scope-end-line) for one let_declaration, or '() when
+;; its pattern is not a single plain name. The anchor is the declaration's end
+;; byte -- after the `;` -- so the value sits at the end of the statement,
+;; where VS Code and IntelliJ put it: a second `= 15.5` in the middle of a line
+;; that already has an `=` and an initializer reads as part of the expression.
+;;
+;; scope-end-line is the last line of the block this binding lives in, handed
+;; down by collect-lets. It is what decides whether the binding is still alive
+;; where execution stopped -- see dedupe-let-anchors.
+(define (let-anchor text node scope-end)
   (define name-node (pattern-name-node (let-pattern-node node)))
   (if name-node
       (list (list (node-text text name-node)
                   (b->c text (tsnode-end-byte node))
-                  (node-start-line text node)))
+                  (node-start-line text node)
+                  scope-end))
       '()))
 
-;; Every simple let in fn-node's body, in source order, as (name anchor line)
-;; triples. A recursive walk, not just named children: lets nest inside
-;; blocks, if/match arms and loops. Subtrees that open a DIFFERENT scope than
-;; the stopped frame's are pruned -- nested function_item, closure_expression,
-;; async_block, try_block: their lets are not this frame's locals, and
-;; annotating them from the outer frame's variables would put a confidently
-;; wrong value on the line whenever a captured name collides.
-(define (collect-lets text node acc)
+;; Every simple let in fn-node's body, in source order, as
+;; (name anchor line scope-end-line) entries. A recursive walk, not just named
+;; children: lets nest inside blocks, if/match arms and loops. Subtrees that
+;; open a DIFFERENT scope than the stopped frame's are pruned -- nested
+;; function_item, closure_expression, async_block, try_block: their lets are
+;; not this frame's locals, and annotating them from the outer frame's
+;; variables would put a confidently wrong value on the line whenever a
+;; captured name collides.
+;;
+;; scope-end tracks the innermost enclosing `block`, which is the only node a
+;; let_declaration can sit in -- `if let` and `let ... else` are different node
+;; kinds and bind nothing here. The function body is itself a block, so a
+;; top-level let picks its end up on the first descent.
+(define (collect-lets text node acc scope-end)
   (let loop ([cs (tsnode-children node)] [acc acc])
     (if (null? cs)
         acc
@@ -225,10 +236,11 @@
                   (equal? k "async_block")
                   (equal? k "try_block"))
               (loop (cdr cs) acc)
-              (let* ([acc2 (if (equal? k "let_declaration")
-                               (append acc (let-anchor text c))
+              (let* ([inner (if (equal? k "block") (node-end-line text c) scope-end)]
+                     [acc2 (if (equal? k "let_declaration")
+                               (append acc (let-anchor text c scope-end))
                                acc)])
-                (loop (cdr cs) (collect-lets text c acc2))))))))
+                (loop (cdr cs) (collect-lets text c acc2 inner))))))))
 
 (define (name-in-entries? entries name)
   (let loop ([es entries])
@@ -237,35 +249,56 @@
       [(equal? (list-ref (car es) 0) name) #t]
       [else (loop (cdr es))])))
 
-;; The shadowing rule (v1.5, deliberately bounded, and the thing the
-;; scope-aware follow-up replaces): when a name is bound by more than one let
-;; in the function, annotate ONLY the last binding at or above the stop line
-;; -- the one most likely in scope -- and leave the others bare. lldb may
-;; report two locals both named "x" and nothing in the DAP response says
-;; which block each belongs to, so per name this is the best available guess,
-;; and a confidently wrong number is worse than a blank line. Lets below the
-;; stop line are dropped here as well: lldb usually does not report an
-;; un-executed binding anyway (measured: a stop ON the let line reports 3
-;; locals, one step later 4), but the filter does not rely on that.
-;; Triples come in source order, so for one name the later entry replaces the
-;; earlier; returns ((name . anchor-char) ...).
-(define (dedupe-let-anchors triples stop-line)
-  (let loop ([ts triples] [kept '()])
+;; Which bindings may be annotated, and which of a shadowed pair wins.
+;;
+;; A binding is a candidate only when execution could actually be sitting in
+;; it: declared at or above the stop line, AND the block it lives in still
+;; contains the stop line. That second test is what keeps an exited block's
+;; binding bare. Without it:
+;;
+;;     let shadowed = "outer";
+;;     { let shadowed = "inner"; }
+;;     println!(...);              // <- stopped here
+;;
+;; the inner binding is the last one above the stop, so it got annotated --
+;; with the only value lldb still reports, the OUTER one. That is a wrong
+;; value on an out-of-scope line, which is worse than the blank line this is
+;; supposed to degrade to. Measured before the fix: stopping inside the block
+;; rendered `= "inner"` correctly, stopping after it rendered `= "outer"` on
+;; the inner line.
+;;
+;; Among the survivors, a repeated name keeps the LAST one: entries arrive in
+;; source order, and nothing in the DAP response says which block a variable
+;; belongs to, so when two live bindings really do share a name the innermost
+;; declaration is the better guess. Full scope-aware resolution is still the
+;; follow-up; this narrows the window where a guess is needed to the case
+;; where both candidates are genuinely in scope.
+;;
+;; Lets below the stop line are dropped here too. lldb usually does not report
+;; an un-executed binding anyway (measured: a stop ON the let line reports 3
+;; locals, one step later 4), but the filter does not lean on that.
+;;
+;; Returns ((name . anchor-char) ...).
+(define (dedupe-let-anchors entries stop-line)
+  (let loop ([ts entries] [kept '()])
     (if (null? ts)
         (map (lambda (t) (cons (list-ref t 0) (list-ref t 1))) kept)
         (let* ([t (car ts)]
-               [name (list-ref t 0)])
-          (if (> (list-ref t 2) stop-line)
+               [name (list-ref t 0)]
+               [declared-above (<= (list-ref t 2) stop-line)]
+               [scope-alive (<= stop-line (list-ref t 3))])
+          (if (not (and declared-above scope-alive))
               (loop (cdr ts) kept)
               (loop (cdr ts)
                     (if (name-in-entries? kept name)
                         (map (lambda (e) (if (equal? (list-ref e 0) name) t e)) kept)
                         (append kept (list t)))))))))
 
-;; (name . anchor-char) per simple let in fn-node's body, deduped per the
-;; shadowing rule above.
+;; (name . anchor-char) per simple let in fn-node's body, filtered and deduped
+;; per the rule above.
 (define (let-anchors text fn-node stop-line)
-  (dedupe-let-anchors (collect-lets text fn-node '()) stop-line))
+  (dedupe-let-anchors (collect-lets text fn-node '() (node-end-line text fn-node))
+                      stop-line))
 
 ;; -- drawing ----------------------------------------------------------------
 
