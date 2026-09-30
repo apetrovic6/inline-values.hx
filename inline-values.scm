@@ -404,7 +404,15 @@
   (if enabled (inline-values-disable) (inline-values-enable)))
 
 ;; A debugger stop already fires this (jump_to_stack_frame ends in
-;; doc.set_selection), as do steps and frame switches -- no DAP event hook is
-;; needed, and none exists. When not debugging the callback is the light
-;; path: one local-state read and a comparison.
+;; doc.set_selection), as do steps and frame switches. When not debugging
+;; the callback is the light path: one local-state read and a comparison.
 (register-hook 'selection-did-change (lambda (view-id) (inline-values-render)))
+
+;; Terminate is the lifecycle event that does NOT move the cursor: no
+;; set_selection, so no selection-did-change, and the #f branch's
+;; stale-value clear would never run -- the e2e caught hints surviving
+;; `space G t` until some unrelated cursor move. post-command fires for the
+;; terminate keypress itself, and for the next keystroke after a debuggee
+;; exits on its own (also cursor-free). Same light path per command: frame
+;; read, tuple compare, return -- the 0-refetch gate is untouched.
+(register-hook 'post-command (lambda (command-name) (inline-values-render)))

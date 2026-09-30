@@ -24,16 +24,22 @@ what makes the refresh gate below sound.
 
 ## How it works
 
-**Trigger.** One hook:
+**Trigger.** Two hooks:
 
 ```scheme
 (register-hook 'selection-did-change (lambda (view-id) (inline-values-render)))
+(register-hook 'post-command (lambda (command-name) (inline-values-render)))
 ```
 
 A debugger stop calls `jump_to_stack_frame`, which ends in `doc.set_selection`,
 which dispatches `SelectionDidChange`. Stops, steps and frame switches all move
-the cursor, so all three fire this. No DAP event hook is needed (and none
-exists).
+the cursor, so all three fire the first hook. No DAP event hook is needed (and
+none exists). **Terminate is the exception**: it moves nothing, so without the
+second hook the stale-value clear never runs — the e2e caught hints surviving
+`space G t` until an unrelated cursor move. `post-command` fires for the
+terminate keypress itself, and for the next keystroke after a debuggee exits
+on its own. Both hooks run the same light path, so the gate below is what
+every firing costs.
 
 **Refresh gate.** The hook fires on every cursor move; values only change when
 the debugger does:
