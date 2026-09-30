@@ -204,11 +204,15 @@
         (when tree
           (define text (editor->text doc))
           ;; frame.line is 1-based (DAP); rope and tree lines are 0-based.
-          (define fn (find-function-at-line text
-                                            (tstree->root tree)
-                                            (- (list-ref frame 1) 1)))
-          (when fn
-            (draw-parameters text fn vars))))
+          ;; The binding is called fnode, not fn: `fn` is Steel's lambda
+          ;; shorthand, and (define fn ...) panics the compiler's analysis
+          ;; pass (Option::unwrap on a desugared non-atom name) -- which
+          ;; takes helix down at startup, before a frame is ever drawn.
+          (define fnode (find-function-at-line text
+                                               (tstree->root tree)
+                                               (- (list-ref frame 1) 1)))
+          (when fnode
+            (draw-parameters text fnode vars))))
       ;; Not the frame's file: never draw. If this buffer still holds hints
       ;; from earlier, drop them so no stale values survive over text the
       ;; debugger has moved away from.

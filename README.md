@@ -99,6 +99,12 @@ cannot be *evaluated* outside the editor (it requires `helix/*`), and an
 unbalanced paren there fails silently at helix startup. The nix build runs it
 via `doSteelCheck`.
 
+One compiler trap this repo has already paid for: `fn` is Steel's lambda
+shorthand, so `(define fn ...)` — or `struct`, or `lambda` as a binding name —
+panics Steel's analysis pass (`Option::unwrap` on a desugared non-atom define
+name) and takes helix down at startup, before a frame is drawn. Bindings that
+hold a function node are called `fnode` here for that reason.
+
 Consumer wiring (magos): flake input `inline-values-hx` (a `path:` input
 while developing — pinned by narHash, so `nix flake update inline-values-hx`
 after every edit), `selectPlugins` in `modules/features/helix/default.nix`,
