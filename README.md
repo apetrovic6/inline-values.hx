@@ -65,6 +65,23 @@ It is only ever called in the stopped frame's Rust buffer — the one place
 where nothing else in the stack draws (vista renders markdown only,
 scopeline draws no decorations) — or in a buffer this plugin itself drew into.
 
+**Decorations do not survive buffer switches.** With `lsp.display-inlay-hints`
+off (helix's default), `Editor::_refresh` resets the document's whole
+inlay-hint storage — styled plugin hints included — and an `:open` round-trip
+in this helix build also resets the view's selection to 1:1. Both facts are
+plain editor behavior, not this plugin's. The plugin self-heals: the reset
+selection fires `selection-did-change`, and the redraw path runs from
+cached variables, so restoring hints after a switch costs zero DAP calls.
+
+**Known adapter hazard (not a plugin bug).** On frames that land
+mid-expression inside an inlined callee — a step-over out of a small
+`const fn`, a breakpoint resolving inside inlined generic code — codelldb
+1.12.2 can die processing *any* client's `variables` request; helix's own
+`space G v` picker kills it identically with this plugin disabled. The 0007
+guards turn the dead request into `'()`: the plugin draws nothing for that
+frame and helix stays up. Established by `/tmp/hx-dap-test/iv-exp-c.sh`
+against the counter tui app.
+
 ## Commands
 
 | command | what |
