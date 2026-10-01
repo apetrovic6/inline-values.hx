@@ -2,12 +2,14 @@
 
 Debugger values drawn inline in the [Helix](https://helix-editor.com) editor
 while stopped — the `fn add(x: f32 = 5, y: f32 = 10.5)` / `let sum = x + y; = 15.5`
-rendering popularized by VS Code / IntelliJ, for a codelldb session in Helix.
+/ `let (a, b) = compute(); a = 1, b = 2` rendering popularized by VS Code /
+IntelliJ, for a codelldb session in Helix.
 
-> **Status: v1.5, still deliberately narrow.** Function parameters and
-> single-name `let` bindings, the stopped frame only, the focused buffer
-> only, Rust only. Destructuring patterns, parent frames and struct
-> expansion come after (see *Out of scope*).
+> **Status: v1.6, still deliberately narrow.** Function parameters (plain
+> identifiers only) and `let` bindings — single-name or destructured, one
+> hint per statement — the stopped frame only, the focused buffer only,
+> Rust only. Destructured parameters, parent frames and struct expansion
+> come after (see *Out of scope*).
 
 Requires Helix with the experimental Steel plugin system
 ([mattwparas/helix, `steel-event-system`](https://github.com/mattwparas/helix/tree/steel-event-system))
@@ -77,33 +79,52 @@ plain `identifier` (an optional `mut` is skipped), draw
 `(add-styled-inlay-hint <param end char> " = <value>")` — anchored at the
 parameter's end byte converted through `text.rope-byte->char`, which is what
 keeps hints correct when a comment upstream has an accent in it. Values are
-truncated to 40 characters.
+truncated to 48 characters.
 
-**Let placement (v1.5).** The same `function_item` is then walked recursively
+**Let placement (v1.6).** The same `function_item` is then walked recursively
 for `let_declaration` nodes — through blocks, `if`/`match` arms and loops —
 pruning subtrees that open a *different* scope than the stopped frame's
 (nested `function_item`, `closure_expression`, `async_block`, `try_block`):
 their `let`s are not this frame's locals, and annotating them from the outer
 frame's variables could put a confidently wrong value on the line when a
-captured name collides. Only patterns binding a single plain name are drawn
-(`identifier`, with `mut` handled in both shapes tree-sitter-rust produces —
-the `mutable_specifier` sibling slot, which is what `let mut` actually uses
-at the pinned grammar rev since `mut_pattern` is `prec(-1)`, and the
-`mut_pattern` wrapper); destructuring is skipped silently. The hint anchors
-at the declaration's end byte — after the `;` — because a second `= 15.5`
-mid-line, in a statement that already has an `=` and an initializer, reads as
-part of the expression. Un-executed `let`s below the stop line need no
-filtering in the common case: lldb reports a local only once it is in scope,
-so `find-var` simply misses.
+captured name collides. `pattern-names` collects every name a pattern binds,
+recursively: `identifier`; the `mut_pattern`/`ref_pattern`/
+`reference_pattern` wrappers; `tuple_pattern` and `tuple_struct_pattern`
+elements; `struct_pattern` fields in both shapes — shorthand `{ host }`
+binds the name itself, rename `{ host: h }` binds the pattern after the
+colon, so the hint says `h`, not `host`. Skipped silently: `_`,
+`or_pattern` (nothing says which side bound), literal and range patterns,
+`slice_pattern`, `..` and `x @ pat`. The pattern node itself is found by
+walking *all* children up to the first `=`/`:`/`;`/`else` token — `_` is an
+anonymous node, and a named-children walk of `let _ = y;` would hand back
+the value `y` and annotate the wildcard let with it (v1.5 did).
+
+**One hint per statement, not one per name.** A destructured `let` draws a
+single trailing hint with the bound pairs joined — `let (a, b) = compute();
+a = 1, b = 2` — capped at four pairs, then `, +N more`. A hint after each
+identifier *inside* the pattern would read as a default
+(`let (a = 1, b = 2) = …`), and struct patterns would scatter them across
+the line; one trailing hint keeps the v1.5 anchor — the declaration's end
+byte, after the `;` — because a second `= 15.5` mid-line, in a statement
+that already has an `=` and an initializer, reads as part of the
+expression. A single plain identifier (with or without `mut`) keeps the
+v1.5 ` = value` shape. Names lldb does not (yet) report are dropped from
+the hint; when none resolve, nothing is drawn rather than an empty `=`.
+Un-executed `let`s below the stop line need no filtering in the common
+case: lldb reports a local only once it is in scope, so `find-var` simply
+misses.
 
 **Shadowing is bounded, not solved.** lldb can report two locals with the
 same name and nothing in the DAP response says which block each belongs to,
 so when a name is bound by several `let`s, only the **last binding at or
 above the stop line** is annotated and the others stay bare — the binding
 most likely in scope, and a blank line rather than a confidently wrong
-number for the rest. Scope-aware resolution from tree-sitter replaces this
-rule; until then it is the deliberate v1.5 behavior (see the comment on
-`dedupe-let-anchors`).
+number for the rest. With several names per statement the rule applies per
+name: a later `let sh_x = 99;` strips `sh_x` from an earlier
+`let (sh_x, sh_y)`'s hint, which keeps showing `sh_y = 2`, and a statement
+that loses every name drops out. Scope-aware resolution from tree-sitter
+replaces this rule; until then it is the deliberate v1.6 behavior (see the
+comment on `dedupe-let-anchors`).
 
 **Clearing.** `clear-decorations!` drops every plugin overlay and styled hint
 in the focused view (native LSP inlay hints are separate storage and survive).
@@ -141,10 +162,14 @@ against the counter tui app.
 
 In rough order of what to add next:
 
-- **destructuring patterns** — `tuple_pattern`, `struct_pattern`,
-  `tuple_struct_pattern`, `ref_pattern`, `or_pattern`: each binds several
-  names and needs one anchor per name, plus a choice of which end of the
-  pattern to hang each on. Skipped silently today.
+- **destructured parameters** — the parameter path still draws plain
+  identifiers and `self` only; `fn f((a, b): (i32, i32))` stays bare. The
+  `pattern-names` recursion would carry over, but the anchor choice (one
+  hint per parameter vs per statement) is open.
+- **`slice_pattern`** — `[first, rest @ ..]`-style patterns are skipped
+  silently; the same recursion would cover the binding elements.
+- **`or_pattern`** — `Ok(v) | Err(v)` binds `v` from either side; which
+  value the hint shows is a design question, not a traversal one.
 - **parent frames** — when switching frames with `space G s f` the frame
   tuple changes, so the gate already refetches; drawing a frame from a file
   that is not focused is the missing piece.

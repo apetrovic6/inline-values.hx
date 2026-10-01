@@ -2,15 +2,17 @@
 ;;;
 ;;; While the debugger is stopped, draws the stopped frame's variable values
 ;;; after each parameter of the function signature the frame is in, and after
-;;; each simple `let` statement in its body:
+;;; each `let` statement in its body:
 ;;;
 ;;;     fn add(x: f32 = 5, y: f32 = 10.5) -> f32 {
 ;;;         let sum = x + y; = 15.5
+;;;         let (a, b) = compute(); a = 1, b = 2
 ;;;
 ;;; Parameters are the values you were called with; the lets are the ones you
-;;; are building. v1.5 scope, still deliberately narrow: function parameters
-;;; and single-name let bindings only, the stopped frame only, the focused
-;;; buffer only, Rust only. Destructuring patterns, parent frames and struct
+;;; are building. v1.6 scope, still deliberately narrow: function parameters
+;;; (plain identifiers only) and let bindings -- single-name or destructured,
+;;; one hint per statement -- the stopped frame only, the focused buffer
+;;; only, Rust only. Destructured parameters, parent frames and struct
 ;;; expansion come after.
 ;;;
 ;;; Requires a helix carrying the DAP Steel API (dap-current-frame,
@@ -50,6 +52,13 @@
 ;; it ends. Keeping the last few characters puts the closing braces back, so
 ;; the elision reads as "a big struct" rather than as a truncated word.
 (define value-tail-length 8)
+
+;; How many `name = value` pairs one destructured let may show before the
+;; rest collapse into `, +N more`. Several values share a single trailing
+;; hint here, and each is already capped at max-value-length; a statement
+;; binding more than this is better read in the variables picker than
+;; inline.
+(define max-let-pairs 4)
 
 ;; -- refresh gate state -----------------------------------------------------
 ;;
@@ -188,54 +197,142 @@
 
 ;; -- let bindings -----------------------------------------------------------
 
-;; The identifier a pattern binds, or #f when the pattern is not a single
-;; plain name. Handles both shapes tree-sitter-rust produces for `mut`:
-;; the mutable_specifier sibling slot (what let_declaration actually uses at
-;; the grammar rev helix pins -- mut_pattern is prec(-1) and loses to it)
-;; and the mut_pattern wrapper, which other pattern positions can still
-;; surface. Every other pattern kind -- tuple, struct, tuple-struct, ref,
-;; or, wildcard -- binds zero or several names and each would need its own
-;; anchor per name: skipped silently, a follow-up rather than an error.
-(define (pattern-name-node pat)
-  (cond
-    [(not pat) #f]
-    [(equal? (tsnode-kind pat) "identifier") pat]
-    [(equal? (tsnode-kind pat) "mut_pattern")
-     (pattern-name-node (find-child pat
-                                    (lambda (n)
-                                      (not (equal? (tsnode-kind n) "mutable_specifier")))))]
-    [else #f]))
+;; Every name a pattern binds, as nodes in source order; '() for the kinds
+;; this plugin skips. Recursive over the shapes the pinned tree-sitter-rust
+;; grammar (rev 261b2022) gives a let_declaration's `pattern` field:
+;;
+;;   identifier                      itself
+;;   mut_pattern                     the wrapped pattern (named children:
+;;                                   mutable_specifier, then the pattern)
+;;   ref_pattern, reference_pattern  the wrapped pattern ('ref'/'&' are
+;;                                   anonymous children)
+;;   tuple_pattern                   each element, recursively
+;;   tuple_struct_pattern            each element after the `type` child
+;;   struct_pattern                  each field_pattern after the `type`
+;;                                   child (no field_pattern_list node at
+;;                                   this rev)
+;;
+;; A field_pattern comes in two shapes: shorthand `{ host }` -- a
+;; shorthand_field_identifier, itself the binding -- and rename
+;; `{ host: h }` -- a field_identifier followed by the real binding, which
+;; recurses (so `{ host: ref h }` and `{ host: (a, b) }` work too). An
+;; optional mutable_specifier (`{ mut host }`) is skipped.
+;;
+;; Skipped silently, per the v1.6 design: `_` (an anonymous node -- binds
+;; nothing, and never reaches here as a named child), or_pattern (a name can
+;; come from either side, and nothing says which bound), literal and range
+;; patterns, slice_pattern (same recursion would cover it -- worth adding
+;; later), remaining_field_pattern (`..` binds nothing) and captured_pattern
+;; (`x @ pat`). The default is '(), so an unknown kind degrades to no hint
+;; rather than to a wrong one.
+(define (pattern-names pat)
+  (if (not pat)
+      '()
+      (let ([k (tsnode-kind pat)])
+        (cond
+          [(equal? k "identifier") (list pat)]
+          [(or (equal? k "mut_pattern")
+               (equal? k "ref_pattern")
+               (equal? k "reference_pattern"))
+           (pattern-names (first-pattern-child pat))]
+          [(equal? k "tuple_pattern")
+           (children-names (tsnode-named-children pat))]
+          [(equal? k "tuple_struct_pattern")
+           ;; No field-name API in the treesitter cog; the grammar puts
+           ;; `type` first among the named children, then the elements.
+           (children-names (skip-first-named pat))]
+          [(equal? k "struct_pattern")
+           (fields-names (skip-first-named pat))]
+          [else '()]))))
 
-;; The pattern node of a let_declaration: the first NAMED child that is not
-;; the mutable_specifier. Named, because the leading `let` keyword is an
-;; anonymous child and would otherwise match any "not mut" predicate.
-(define (let-pattern-node node)
+;; The first named child that is not a mutable_specifier: the wrapped pattern
+;; of the mut/reference wrappers.
+(define (first-pattern-child node)
   (let loop ([cs (tsnode-named-children node)])
     (cond
       [(null? cs) #f]
       [(equal? (tsnode-kind (car cs)) "mutable_specifier") (loop (cdr cs))]
       [else (car cs)])))
 
-;; (name anchor-char line scope-end-line) for one let_declaration, or '() when
-;; its pattern is not a single plain name. The anchor is the declaration's end
-;; byte -- after the `;` -- so the value sits at the end of the statement,
-;; where VS Code and IntelliJ put it: a second `= 15.5` in the middle of a line
-;; that already has an `=` and an initializer reads as part of the expression.
+(define (skip-first-named node)
+  (let ([cs (tsnode-named-children node)])
+    (if (null? cs) '() (cdr cs))))
+
+(define (children-names cs)
+  (let loop ([cs cs] [acc '()])
+    (if (null? cs)
+        acc
+        (loop (cdr cs) (append acc (pattern-names (car cs)))))))
+
+;; The field_pattern / remaining_field_pattern children of a struct_pattern.
+(define (fields-names cs)
+  (let loop ([cs cs] [acc '()])
+    (if (null? cs)
+        acc
+        (loop (cdr cs) (append acc (field-pattern-names (car cs)))))))
+
+(define (field-pattern-names fp)
+  (if (equal? (tsnode-kind fp) "field_pattern")
+      (let loop ([cs (tsnode-named-children fp)])
+        (cond
+          [(null? cs) '()]
+          [(equal? (tsnode-kind (car cs)) "mutable_specifier") (loop (cdr cs))]
+          [(equal? (tsnode-kind (car cs)) "shorthand_field_identifier") (list (car cs))]
+          ;; A field_identifier: the pattern after the ':' is the binding
+          ;; when there is one. `{ host: _ }` recurses to '() -- the name is
+          ;; a field_identifier, which binds nothing.
+          [(null? (cdr cs)) '()]
+          [else (pattern-names (car (cdr cs)))]))
+      ;; remaining_field_pattern and anything else in the braces
+      '()))
+
+;; The pattern node of a let_declaration, or #f. Walks ALL children and
+;; stops at the first token that can only follow the pattern -- '=', ':',
+;; ';', 'else'. The stop matters: '_' is an ANONYMOUS node, so the v1.5
+;; named-children walk of `let _ = y;` handed back the value `y` as the
+;; pattern, which annotated the wildcard let with y's value. Returning the
+;; '_' node instead lets pattern-names skip it like every other non-binding.
+(define (let-pattern-node node)
+  (let loop ([cs (tsnode-children node)])
+    (if (null? cs)
+        #f
+        (let ([k (tsnode-kind (car cs))])
+          (cond
+            [(or (equal? k "let") (equal? k "mutable_specifier")) (loop (cdr cs))]
+            [(or (equal? k "=") (equal? k ":") (equal? k ";") (equal? k "else")) #f]
+            [else (car cs)])))))
+
+;; One (names anchor-char line scope-end-line bare) entry per let_declaration
+;; whose pattern binds at least one name, or '(). `names` is the source-order
+;; list of bound name strings; `bare` is #t for the single-identifier shape
+;; (plain or mut-wrapped), which keeps the v1.5 ` = value` rendering --
+;; a destructured statement renders ` a = 1, b = 2` at the same anchor.
+;; One hint per statement, not one per name: a hint after each identifier
+;; INSIDE the pattern would read as a default (`let (a = 1, b = 2) = ...`),
+;; and struct patterns would scatter them across the line.
+;;
+;; The anchor is the declaration's end byte -- after the `;` -- so the value
+;; sits at the end of the statement, where VS Code and IntelliJ put it: a
+;; second `= 15.5` in the middle of a line that already has an `=` and an
+;; initializer reads as part of the expression.
 ;;
 ;; scope-end-line is the last line of the block this binding lives in, handed
 ;; down by collect-lets. It is what decides whether the binding is still alive
 ;; where execution stopped -- see dedupe-let-anchors.
 (define (let-anchor text node scope-end)
-  (define name-node (pattern-name-node (let-pattern-node node)))
-  (if name-node
-      (list (list (node-text text name-node)
-                  (b->c text (tsnode-end-byte node))
-                  (node-start-line text node)
-                  scope-end))
-      '()))
+  (define pat (let-pattern-node node))
+  (define name-nodes (pattern-names pat))
+  (if (null? name-nodes)
+      '()
+      (let ([k (tsnode-kind pat)])
+        (list (list (map (lambda (n) (node-text text n)) name-nodes)
+                    (b->c text (tsnode-end-byte node))
+                    (node-start-line text node)
+                    scope-end
+                    (or (equal? k "identifier") (equal? k "mut_pattern")))))))
 
-;; Every simple let in fn-node's body, in source order, as
-;; (name anchor line scope-end-line) entries. A recursive walk, not just named
+;; Every name-binding let in fn-node's body, in source order, as
+;; (names anchor line scope-end-line bare) entries. A recursive walk, not just named
 ;; children: lets nest inside blocks, if/match arms and loops. Subtrees that
 ;; open a DIFFERENT scope than the stopped frame's are pruned -- nested
 ;; function_item, closure_expression, async_block, try_block: their lets are
@@ -264,12 +361,34 @@
                                acc)])
                 (loop (cdr cs) (collect-lets text c acc2 inner))))))))
 
-(define (name-in-entries? entries name)
-  (let loop ([es entries])
+(define (name-in-list? xs name)
+  (let loop ([xs xs])
     (cond
-      [(null? es) #f]
-      [(equal? (list-ref (car es) 0) name) #t]
-      [else (loop (cdr es))])))
+      [(null? xs) #f]
+      [(equal? (car xs) name) #t]
+      [else (loop (cdr xs))])))
+
+;; `xs` without every name in `kill`, order preserved.
+(define (names-minus xs kill)
+  (let loop ([xs xs] [out '()])
+    (cond
+      [(null? xs) (reverse out)]
+      [(name-in-list? kill (car xs)) (loop (cdr xs) out)]
+      [else (loop (cdr xs) (cons (car xs) out))])))
+
+;; Drop shadowed names from the entries kept so far; an entry that loses
+;; every name is dropped whole. Rebuilds each surviving entry with its
+;; remaining names, keeping anchor, line, scope-end and bare flag.
+(define (strip-shadowed kept names)
+  (let loop ([ks kept] [out '()])
+    (if (null? ks)
+        (reverse out)
+        (let* ([e (car ks)]
+               [remaining (names-minus (list-ref e 0) names)])
+          (loop (cdr ks)
+                (if (null? remaining)
+                    out
+                    (cons (cons remaining (cdr e)) out)))))))
 
 ;; Which bindings may be annotated, and which of a shadowed pair wins.
 ;;
@@ -296,38 +415,43 @@
 ;; follow-up; this narrows the window where a guess is needed to the case
 ;; where both candidates are genuinely in scope.
 ;;
+;; With several names per statement the rule applies per NAME: a later
+;; `let a = ...` strips `a` from an earlier `let (a, b)` entry, which keeps
+;; `b` -- the earlier line shows only what it still owns, and a statement
+;; that loses every name drops out. A statement is emitted once, never once
+;; per name: two names from the same let must not produce two hints at the
+;; same anchor.
+;;
 ;; Lets below the stop line are dropped here too. lldb usually does not report
 ;; an un-executed binding anyway (measured: a stop ON the let line reports 3
 ;; locals, one step later 4), but the filter does not lean on that.
 ;;
-;; Returns ((name . anchor-char) ...).
+;; Returns the surviving (names anchor line scope-end bare) entries.
 (define (dedupe-let-anchors entries stop-line)
   (let loop ([ts entries] [kept '()])
     (if (null? ts)
-        (map (lambda (t) (cons (list-ref t 0) (list-ref t 1))) kept)
+        kept
         (let* ([t (car ts)]
-               [name (list-ref t 0)]
                [declared-above (<= (list-ref t 2) stop-line)]
                [scope-alive (<= stop-line (list-ref t 3))])
           (if (not (and declared-above scope-alive))
               (loop (cdr ts) kept)
               (loop (cdr ts)
-                    (if (name-in-entries? kept name)
-                        (map (lambda (e) (if (equal? (list-ref e 0) name) t e)) kept)
-                        (append kept (list t)))))))))
+                    (append (strip-shadowed kept (list-ref t 0)) (list t))))))))
 
-;; (name . anchor-char) per simple let in fn-node's body, filtered and deduped
-;; per the rule above.
+;; The let entries of fn-node's body, filtered and deduped per the rule
+;; above: (names anchor line scope-end bare) per surviving statement.
 (define (let-anchors text fn-node stop-line)
   (dedupe-let-anchors (collect-lets text fn-node '() (node-end-line text fn-node))
                       stop-line))
 
 ;; -- drawing ----------------------------------------------------------------
 
-;; One hint per (name . anchor-char) whose name the Local scope reports.
-;; Shared by the parameter and let passes: same find-var, same truncation,
-;; same style -- consistency is the default; making lets dimmer than
-;; signature values would be a one-token change in value-style.
+;; One hint per (name . anchor-char) whose name the Local scope reports --
+;; the parameter pass, which is plain identifiers only and keeps the bare
+;; ` = value` shape. Same find-var, truncation and style as the let pass;
+;; making lets dimmer than signature values would be a one-token change in
+;; value-style.
 (define (draw-anchors anchors vars)
   (let loop ([as anchors])
     (when (not (null? as))
@@ -339,11 +463,57 @@
                                            (value-style)))))
       (loop (cdr as)))))
 
+;; ` n1 = v1, n2 = v2` for the first max-let-pairs of `resolved`, with a
+;; `, +N more` tail when there are further pairs.
+(define (join-let-pairs resolved)
+  (define total (length resolved))
+  (define shown (if (> total max-let-pairs) max-let-pairs total))
+  (let loop ([ps resolved] [i 0] [out ""])
+    (cond
+      [(>= i shown)
+       (if (> total shown)
+           (string-append out ", +" (to-string (- total shown)) " more")
+           out)]
+      [else
+       (loop (cdr ps)
+             (+ i 1)
+             (string-append out
+                            (if (= i 0) " " ", ")
+                            (car (car ps))
+                            " = "
+                            (cdr (car ps))))])))
+
+;; One hint per surviving let statement. Every name is looked up with
+;; find-var and the ones lldb does not (yet) report are dropped -- a binding
+;; below the stop, a name that never initialised; when nothing resolves,
+;; nothing is drawn rather than an empty `=`. A bare entry keeps the v1.5
+;; ` = value` shape; a destructured statement joins its pairs.
+(define (draw-let-entries entries vars)
+  (let loop ([es entries])
+    (when (not (null? es))
+      (define e (car es))
+      (define resolved
+        (let rloop ([ns (list-ref e 0)] [acc '()])
+          (if (null? ns)
+              (reverse acc)
+              (let ([v (find-var (car ns) vars)])
+                (rloop (cdr ns)
+                       (if v
+                           (cons (cons (car ns) (truncate-value (list-ref v 2))) acc)
+                           acc))))))
+      (when (not (null? resolved))
+        (add-styled-inlay-hint (list-ref e 1)
+                               (list (list (if (list-ref e 4)
+                                               (string-append " = " (cdr (car resolved)))
+                                               (join-let-pairs resolved))
+                                           (value-style)))))
+      (loop (cdr es)))))
+
 (define (draw-parameters text fn-node vars)
   (draw-anchors (parameter-anchors text fn-node) vars))
 
 (define (draw-lets text fn-node vars stop-line)
-  (draw-anchors (let-anchors text fn-node stop-line) vars))
+  (draw-let-entries (let-anchors text fn-node stop-line) vars))
 
 ;; Fetch the Local scope's variables: (dap-scopes) to find its reference,
 ;; then (dap-variables). Two DAP round-trips, and the only place this plugin
