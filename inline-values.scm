@@ -42,7 +42,14 @@
 
 ;; Display cap for one value. A Vec prints size=3, but a struct's rendering
 ;; is unbounded and the space mid-signature is small.
-(define max-value-length 40)
+(define max-value-length 48)
+
+;; How much of the tail to keep when a value is cut. Cutting only the head
+;; turns a deep struct into `{backend:{writer:{inner:{mutex:{futex:{v…` --
+;; every character spent on nesting and none on content, and no sign of where
+;; it ends. Keeping the last few characters puts the closing braces back, so
+;; the elision reads as "a big struct" rather than as a truncated word.
+(define value-tail-length 8)
 
 ;; -- refresh gate state -----------------------------------------------------
 ;;
@@ -102,9 +109,13 @@
   (or (equal? lang "rust") (equal? lang 'rust)))
 
 (define (truncate-value s)
-  (if (> (string-length s) max-value-length)
-      (string-append (substring s 0 max-value-length) "…")
-      s))
+  (define len (string-length s))
+  (if (<= len max-value-length)
+      s
+      (let ([head (- max-value-length value-tail-length)])
+        (string-append (substring s 0 head)
+                       "…"
+                       (substring s (- len value-tail-length) len)))))
 
 ;; read from the theme on every draw so hints follow theme changes; italics
 ;; separate debugger output from source text
@@ -133,10 +144,18 @@
 ;;
 ;; tree-sitter-rust: parameter = [mutable_specifier] pattern ":" type, so
 ;; the pattern is the first named child after an optional `mut`. v1 draws
-;; only plain identifiers -- tuple/struct patterns, `self` and references
-;; are skipped (their names do not match a single Local variable anyway).
-;; The anchor is the parameter node's end byte: the hint lands after the
-;; type, before the comma.
+;; Plain identifiers, plus `self`. Tuple and struct patterns are skipped --
+;; their names do not match a single Local variable anyway.
+;;
+;; `self` is its own node kind (a `parameters` node holds `parameter`,
+;; `self_parameter` or `variadic_parameter`), which is why it needs a branch
+;; rather than falling out of the identifier case. It is also the one that
+;; matters most: in a method, every field the code touches hangs off it, and
+;; codelldb reports it as a Local named "self" like any other.
+;;
+;; The anchor is the node's end byte either way: after the type for a normal
+;; parameter, after `self` itself for the receiver -- before the comma in
+;; both cases.
 (define (parameter-anchors text fn-node)
   (define params (find-child fn-node (lambda (n) (equal? (tsnode-kind n) "parameters"))))
   (if (not params)
@@ -144,17 +163,20 @@
       (let loop ([cs (tsnode-named-children params)] [acc '()])
         (if (null? cs)
             (reverse acc)
-            (let ([c (car cs)])
-              (if (equal? (tsnode-kind c) "parameter")
-                  (let ([pat (find-child c (lambda (n)
-                                             (not (equal? (tsnode-kind n) "mutable_specifier"))))])
-                    (if (and pat (equal? (tsnode-kind pat) "identifier"))
-                        (loop (cdr cs)
-                              (cons (cons (node-text text pat)
-                                          (b->c text (tsnode-end-byte c)))
-                                    acc))
-                        (loop (cdr cs) acc)))
-                  (loop (cdr cs) acc)))))))
+            (let* ([c (car cs)]
+                   [k (tsnode-kind c)]
+                   [anchor (b->c text (tsnode-end-byte c))])
+              (cond
+                [(equal? k "self_parameter")
+                 (loop (cdr cs) (cons (cons "self" anchor) acc))]
+                [(equal? k "parameter")
+                 (let ([pat (find-child c (lambda (n)
+                                            (not (equal? (tsnode-kind n) "mutable_specifier"))))])
+                   (if (and pat (equal? (tsnode-kind pat) "identifier"))
+                       (loop (cdr cs)
+                             (cons (cons (node-text text pat) anchor) acc))
+                       (loop (cdr cs) acc)))]
+                [else (loop (cdr cs) acc)]))))))
 
 ;; the (name type value reference) tuple for `name` in the Local scope, or #f
 (define (find-var name vars)
