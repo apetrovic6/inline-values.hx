@@ -26,18 +26,17 @@ what makes the refresh gate below sound.
 
 ## How it works
 
-**Trigger.** Three hooks:
+**Trigger.** Two hooks:
 
 ```scheme
 (register-hook 'selection-did-change (lambda (view-id) (inline-values-render)))
 (register-hook 'post-command (lambda (command-name) (inline-values-render)))
-(register-hook 'terminal-focus-gained (lambda () (inline-values-render)))
 ```
 
 A debugger stop calls `jump_to_stack_frame`, which ends in `doc.set_selection`,
 which dispatches `SelectionDidChange`. Stops, steps and frame switches all move
-the cursor, so all three fire the first hook. No DAP event hook is needed (and
-none exists).
+the cursor, so they fire the first hook. No DAP event hook is needed (and none
+exists).
 
 **Terminate is the exception, and its semantics are worth stating exactly.**
 It moves no cursor, and its teardown is async: `dap_terminate` sends the DAP
@@ -50,11 +49,12 @@ that command's `post-command` runs after the teardown has landed — frame
 `#f`, hints cleared. Net observable behavior: the values vanish together
 with the debug menu, with no stale window a user can reach. A debuggee
 exiting on its own clears on the next editor event the same way.
-`terminal-focus-gained` is registered for the external-tty setups where
-focus returns *after* teardown (zero-input clear); measured against the foot
-window here, focus returns *before* the teardown lands, so it early-returns
-harmlessly and `post-command` does the work. All three hooks run the same
-light path, so the gate below is what every firing costs.
+A `terminal-focus-gained` hook was tried for this — the debuggee's tty is an
+external window, so terminate closes it and focus returns with no keypress —
+but measured against the foot window that FocusGained arrives *before* the
+teardown lands, so the frame still compares equal and nothing clears. It
+earned nothing and was dropped. Both remaining hooks run the same light path,
+so the gate below is what every firing costs.
 
 **Refresh gate.** The hook fires on every cursor move; values only change when
 the debugger does:

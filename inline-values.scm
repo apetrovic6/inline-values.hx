@@ -644,11 +644,10 @@
 ;; this (terminate, Escape, gone).
 (register-hook 'post-command (lambda (command-name) (inline-values-render)))
 
-;; The debuggee's tty is an external terminal window in this setup (the
-;; debug-start template spawns foot), so terminate/exit closes it and helix
-;; regains terminal focus with no keypress. Measured: that FocusGained
-;; arrives BEFORE the async teardown lands, so the frame still compares
-;; equal and nothing clears -- but environments where focus returns later
-;; get a zero-input clear for free, and when it does fire the cost is the
-;; same light path.
-(register-hook 'terminal-focus-gained (lambda () (inline-values-render)))
+;; Not hooked: terminal-focus-gained. The debuggee's tty is an external
+;; window here (the debug-start template spawns foot), so terminate closes it
+;; and helix regains focus with no keypress -- which looked like a free
+;; zero-input clear. Measured against that window, the FocusGained arrives
+;; BEFORE the async teardown lands, so the frame still compares equal and
+;; nothing clears. It earned nothing and was dropped; the sticky-menu Escape
+;; above is what actually does the work.
